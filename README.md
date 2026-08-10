@@ -35,7 +35,7 @@ Requires `gcc`, `make`, and Linux kernel headers.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourname/SynFlood-L4.git
+git clone https://github.com/yinlewoaisuru/SynFlood-L4.git
 cd SynFlood-L4
 
 # Compile with extreme optimizations
