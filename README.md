@@ -6,8 +6,6 @@
 
 ## 📄 Source Code (`flood.c`)
 
-Lưu đoạn mã bên dưới thành tệp `flood.c`:
-
 ```c
 #define _GNU_SOURCE
 #include <stdio.h>
